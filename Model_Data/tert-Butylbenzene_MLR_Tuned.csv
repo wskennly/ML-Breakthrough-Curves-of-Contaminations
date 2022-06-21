@@ -1,0 +1,2 @@
+"","nrounds","max_depth","eta","gamma","base_score","max_leaves","max_bin","sketch_eps","grow_policy","max_delta_step","subsample","booster","tree_method","monotone_constraints","objective","eval_metric","predictor","validate_parameters"
+"1",35,22,0.121327055618167,0.248815510189161,0.443722219206393,2387668,1522472,0.25822318601422,"lossguide",2618062.76269531,0.638335693627596,"gbtree","exact","(1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)","reg:squarederror","rmse","cpu_predictor",TRUE

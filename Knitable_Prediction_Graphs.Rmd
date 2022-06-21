@@ -1,0 +1,343 @@
+---
+title: "LOOCV R Model Generation, XGBOOST and OPTIMX"
+author: "Hubert B. Majewski, Kennly Weerasinghe"
+date: "8/1/2021"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r}
+#Load libraries
+pacman::p_load(tidyverse, data.table, dplyr, testthat, numbers, ggplot2, scales, grid, gridExtra, cowplot, ggpubr, xgboost, ICEbox, ICE, vip, pdp, caret, SHAPforxgboost, fastshap, shapvis, h2o, DiagrammeR) # iml package?
+
+#Set memory limitations
+memory.limit(size = 32 * 1024 + 64 * 1024) # Where 64 is paging file size in GB
+
+#Set the current working directory (to pull data etc.)
+#setwd("./")
+
+#Set load directory
+loadDirectory <- getwd()
+
+#Load the data
+loadPath <- paste(loadDirectory, "/result.Rdata", sep = "")
+load(loadPath)
+
+#Setup parallel processing (for graphs)
+coreCluster <- parallel::makeCluster(cores, outfile="")
+doParallel::registerDoParallel(coreCluster, cores = cores)
+
+#Disable warnings for knit
+defaultWarnings <- getOption("warn")
+options(warn = -1)
+```
+
+```{r}
+#For each tracer, print the prediction that was out of sample
+#NOTE: All variables represented as "Time" are PV within the model output
+uniquetracers <- unique(xgb$Tracer)
+
+for (tracer in uniquetracers)
+{
+  
+  #Combine all model data into one table
+  if (!masterModel) {
+    plotData1 <- data.table(Time = results[[tracer]]$oos_predictions$Time, Pred = results[[tracer]]$oos_predictions$Pred, Tracer_Conc = results[[tracer]]$oos_predictions$Tracer_Conc, Tracer = results[[tracer]]$oos_predictions$Tracer, PV = results[[tracer]]$oos_predictions$PV)
+  } else {
+    plotData1 <- data.table(Time = results[["Master"]]$oos_predictions$Time, Pred = results[["Master"]]$oos_predictions$Pred, Tracer_Conc = results[["Master"]]$oos_predictions$Tracer_Conc, Tracer = results[["Master"]]$oos_predictions$Tracer, PV = results[["Master"]]$oos_predictions$PV)
+    plotData1 <- plotData1[Tracer == tracer, ]
+  }
+
+  #Select current tracer to display
+  xgbTracer <- xgb[Tracer == tracer, ]
+  MAX_TIME <- max(xgb$PV)
+
+  #IS Predictions
+  if (!masterModel) {
+    insampleData <- do.call(rbind, lapply(results[uniquetracers[!(uniquetracers %in% tracer)]], function(e) {
+      dataSet <- data.table(Time = e$is_predictions$Time, Pred = e$is_predictions$Pred, Tracer_Conc = e$is_predictions$Tracer_Conc, Tracer = e$is_predictions$Tracer, PV = e$is_predictions$PV)
+      return(dataSet)
+    }))
+    insampleData <- insampleData[Tracer == tracer, ]
+
+    #Average the time for insample as there are multiple in sample predictions at a time.
+    #insampleDataAvg <- insampleData %>% group_by(Time) %>% summarise_at(vars(Pred), list(name = mean))
+    #colnames(insampleDataAvg) <- c("Time", "Pred")
+    #colnames(insampleData) <- c("Time", "Pred")
+  }
+
+  #Plot settings
+  xScale=.5 #spacing on x-axis
+  xBound=9 #Plot x until...
+  yScale=.1 #Spacing on y-axis
+  yBound=.75 #plot y until... (For difference graphs only)
+
+  if(tracer %in% c("Benzene", "Toluene", "Ethylbenzene", "o-Xylene")) {
+    xScale=.25
+    xBound=4
+    yScale=.1
+    yBound=.5
+  }
+  if(tracer %in% c("m-Xylene", "p-Xylene", "1,2,3-Trimethylbenzene", "1,2,4-Trimethylbenzene", "1,3,5-Trimethylbenzene")) {
+    xScale=.5
+    xBound= 5
+    yScale=.1
+    yBound=.6
+  }
+  if(tracer %in% c("n-Propylbenzene", "Isopropylbenzene", "1-Ethyl-2-methylbenzene")) {
+    xScale=.5
+    xBound=6
+    yScale=.1
+    yBound=.7
+  }
+  if(tracer %in% c("Isopropyl-4-methylbenzene", "n-Butylbenzene", "tert-Butylbenzene", "tert-Butylbenzene(2)", "1,2,4,5-Tetramethylbenzene", "Pentamethylbenzene", "Pentamethylbenzene(2)")) {
+    xScale=.5
+    xBound=9.5
+    yScale=.1
+    yBound=.9
+  }
+
+  meas = "#000000"
+  predC = "#00FF00"
+  oga = "#FF0000"
+
+  #Plots
+    EBp <- ggplot() +
+      #Measured
+      geom_line(data = xgbTracer, aes(x = xgbTracer$PV, y = (xgbTracer$Tracer_Conc), color = "Measured"), size = .75) +
+      #OOS
+      #geom_line(data = plotData2, aes(x = plotData2$Time, y = (plotData2$Pred)), color = "orange", size = .75) +
+      geom_line(data = plotData1, aes(x = plotData1$PV, y = plotData1$Pred,  color = "Prediction"), size = .75) +
+      #Label
+      labs(title = paste(ifelse(masterModel, "Master", ""), tracer, "OOS-Prediction"), x = 'Pore Volume', y = 'Tracer_Conc') +
+      scale_color_manual(values = colors) +
+      scale_x_continuous(breaks = seq(from = 0, to = MAX_TIME, by = xScale)) +
+      scale_y_continuous(breaks = seq(from = 0, to = 1, by = yScale)) +
+      coord_cartesian(ylim = c(0, 1),  xlim = c(.5, xBound)) +
+      scale_color_manual(values = c(meas, predC)) +
+      theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+                         panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+      theme(legend.title = element_blank(), legend.position = c(1,.3), legend.justification = c(1,1))
+
+    if (!masterModel) {
+      EBp2 <- ggplot() +
+        #IS
+        geom_line(data = insampleData, aes(x = insampleData$PV, y = insampleData$Pred, color = "Prediction"), size = .75) +
+        #geom_line(data = insampleDataAvg, aes(x = PV, y = Pred), color = "red", size = .75) +
+        #Measured
+        geom_line(data = xgbTracer, aes(x = xgbTracer$PV, y = (xgbTracer$Tracer_Conc), color = "Measured"), size = .75) +
+        #Label
+        labs(title = paste(ifelse(masterModel, "Master", ""), tracer, "IS-Prediction"), x = 'Pore Volume', y = 'Tracer_Conc') +
+        scale_color_manual(values = colors) +
+        scale_y_continuous(breaks = seq(from = 0, to = 1, by = yScale)) +
+        scale_x_continuous(breaks = seq(from = 0, to = MAX_TIME, by = xScale)) +
+        coord_cartesian(ylim = c(0, 1),  xlim = c(.5,xBound)) +
+        scale_color_manual(values = c(meas, predC)) +
+        theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+                           panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+        theme(legend.title = element_blank(), legend.position = c(1,.3), legend.justification = c(1,1))
+    } else EBp2 = NULL
+    
+    #Logit Predictions
+    EBp3 <- ggplot() +
+      #Measured
+      geom_line(data = xgbTracer, aes(x = xgbTracer$PV, y = transformation(xgbTracer$Tracer_Conc), color = "Measured"), size = .75) +
+      #Pred
+      geom_line(data = plotData1, aes(x = plotData1$PV, y = transformation(plotData1$Pred), color = "Prediction"), size = .75) +
+      #Label
+      labs(title = paste(ifelse(masterModel, "Master", ""), tracer, "Logit OOS-Prediction"), x = 'Pore Volume', y = 'Tracer_Conc') +
+      scale_color_manual(values = colors) +
+      scale_x_continuous(breaks = seq(from = 0, to = MAX_TIME, by = xScale)) +
+      scale_y_continuous(breaks = seq(from = -11, to = 11, by = yScale * 50)) +
+      coord_cartesian(ylim = c(-11, 11),  xlim = c(.5, xBound)) +
+      scale_color_manual(values = c(meas, predC)) +
+      theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+                         panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+      theme(legend.title = element_blank(), legend.position = c(1,.3), legend.justification = c(1,1))
+
+
+    #Ogata
+    EBO <- ggplot() +
+      geom_line(data = xgbTracer, aes(x = xgbTracer$PV, y = (xgbTracer$Tracer_Conc), color = "Measured"), size = .75) +
+      geom_line(data = xgbTracer, aes(x = xgbTracer$PV, y = (xgbTracer$`Ogata`),  color = "Ogata"), size = .75) +
+      labs(title = paste(ifelse(masterModel, "Master", ""), tracer, 'Ogata'), x = 'Pore Volume', y = 'Tracer_Conc') +
+      scale_y_continuous(breaks = seq(from = 0, to = 1, by = yScale)) +
+      scale_x_continuous(breaks = seq(from = 0, to = MAX_TIME, by = xScale)) +
+      coord_cartesian(ylim = c(0, 1),  xlim = c(.5,xBound)) +
+      scale_color_manual(values = c(meas, oga)) +
+      theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+                         panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+      theme(legend.title = element_blank(), legend.position = c(1,.3), legend.justification = c(1,1))
+
+    diffData <- plotData1
+    diffData$Tracer_Conc <- abs(plotData1$Tracer_Conc - plotData1$Pred)
+
+    diffDataOgata <- xgbTracer
+    diffDataOgata$Tracer_Conc <- abs(xgbTracer$Tracer_Conc - xgbTracer$`Ogata`)
+
+    #Display list
+    #grid.arrange(grobs = list(EBp, EBp2, EBO, Diff, Diff2), nrow=3, ncol=2, top=textGrob(tracer))
+
+    Diff3 <- ggplot() +
+      geom_line(data = diffData, aes(x = diffData$PV, y = diffData$Tracer_Conc, color = "Prediction")) +
+      geom_line(data = diffDataOgata, aes(x = diffDataOgata$PV, y = diffDataOgata$Tracer_Conc, color = "Ogata")) +
+      labs(title = paste(ifelse(masterModel, "Master", ""), tracer, 'Absolute Error Differences'), x = 'Pore Volume', y = 'Tracer_Conc') +
+      coord_cartesian(ylim = c(0, yBound),  xlim = c(.5, xBound)) +
+      scale_y_continuous(breaks = seq(from = 0, to = 1, by = yScale)) +
+      scale_x_continuous(breaks = seq(from = 0, to = MAX_TIME, by = xScale)) +
+      scale_color_manual(values = c(oga, predC)) +
+      theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+                         panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+      theme(legend.title = element_blank(), legend.position = c(1,1), legend.justification = c(1,1))
+
+    #print(Diff3)
+    lapply(list(EBp, EBp2, EBp3, EBO, Diff3), function(x) ifelse(is.null(x), return(), print(x)))
+    
+}
+
+#A Tree example from forest
+#KNIT THIS AS A HTML FOR RENDERING NO ISSUES
+if (masterModel) {
+  tree <- (xgb.plot.tree(model = results[["Master"]]$model, trees = 1, render = T, plot_width = 2000, plot_height = 4000))
+  tree
+  tree <- (xgb.plot.tree(model = results[["Master"]]$model, trees = 2, render = T, plot_width = 2000, plot_height = 4000))
+  tree
+  tree <- (xgb.plot.tree(model = results[["Master"]]$model, trees = 3, render = T, plot_width = 2000, plot_height = 4000))
+  tree
+}
+
+#Importance values
+# XGB importance tables
+for(tracer in uniquetracers) {
+  
+  if (!masterModel) {
+    features <- results[[tracer]]$model$feature_names
+  } else {
+    features <- results[["Master"]]$model$feature_names
+  }
+  
+  if (length(features) != 1) {
+    if (masterModel) {
+      print("Master")
+      importance <- xgb.importance(feature_names = features, model = results[["Master"]]$model)
+      importance_matrix <- xgb.importance(feature_names = features, model = results[["Master"]]$model)
+      
+      xgbbarplot <- ggplot(data=importance_matrix, aes(x = reorder(Feature, -Gain), y = Gain)) +
+  geom_bar(stat="identity") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "XG Boosted Feature Importance", x = "Features", y = "Information Gain")
+    } else {
+      print(tracer)
+      importance <- xgb.importance(feature_names = features, model = results[[tracer]]$model)
+    }
+    print(importance)
+    xgb.plot.importance(importance_matrix)
+    print(xgbbarplot)
+  }
+  
+  if(masterModel) return()
+}
+
+
+
+#Save all insample data individually from each model
+#While insample exists for the master model, in this code base it is equivalent to the out of sample dataset. Therefore, skip master model.
+if (!dir.exists("Model_Data")) dir.create("Model_Data")
+bindedData <- NULL
+for (tracer in uniquetracers) {
+
+  if (!masterModel) {
+    
+    plotData1 <- data.table(Time = results[[tracer]]$is_predictions$Time, Pred = results[[tracer]]$is_predictions$Pred, Tracer_Conc = results[[tracer]]$is_predictions$Tracer_Conc, Tracer = results[[tracer]]$is_predictions$Tracer, PV = results[[tracer]]$is_predictions$PV)
+    write.csv(x = plotData1, file = paste("Model_Data/", tracer, "_predictions_IS.csv", sep = ""))
+    
+    plotData1 <- data.table(Time = results[[tracer]]$oos_predictions$Time, Pred = results[[tracer]]$oos_predictions$Pred, Tracer_Conc = results[[tracer]]$oos_predictions$Tracer_Conc, Tracer = results[[tracer]]$oos_predictions$Tracer, PV = results[[tracer]]$oos_predictions$PV)
+    write.csv(x = results[[tracer]]$model$params, file = paste("Model_Data/", tracer, "_MLR_Tuned.csv", sep = ""))
+    write.csv(x = plotData1, file = paste("Model_Data/", tracer, "_predictions_OOS.csv", sep = ""))
+  } else {
+    plotData1 <- data.table(Time = results[["Master"]]$oos_predictions$Time, Pred = results[["Master"]]$oos_predictions$Pred, Tracer_Conc = results[["Master"]]$oos_predictions$Tracer_Conc, Tracer = results[["Master"]]$oos_predictions$Tracer, PV = results[["Master"]]$oos_predictions$PV)
+    plotData1 <- plotData1[Tracer == tracer, ]
+    
+    if(is.null(bindedData)) {
+      bindedData <- plotData1
+    } else {
+      bindedData <- rbind(bindedData, plotData1)
+    }
+  }
+}
+if (masterModel) {
+    write.csv(x = results[["Master"]]$model$params, file = paste("Model_Data/", "Master", "_MLR_Tuned.csv", sep = ""))
+    write.csv(x = bindedData, file = paste("Model_Data/", "Master", "_predictions.csv", sep = ""))
+}
+
+#Merge everything together into one table
+printables <- lapply(results, function(e) {
+  data.table(
+    Tracer =  e$Tracer,
+    Monotonic = e$monotonic,
+    SSE = round(as.numeric(e$SSE), digits = 5),
+    IS_SSE = round(as.numeric(e$IS_SSE), digits = 5),
+    R2 = round(as.numeric(e$R2), digits = 5),
+    RMSE = round(as.numeric(e$RMSE), digits = 5)
+  )
+})
+
+if(masterModel) printables$IS_SSE = NULL
+printables <- data.table(rbindlist(printables, fill = TRUE))
+
+
+#Print error data segregated by tracer
+if (masterModel) {
+  individualErrorTable <- NULL
+  for(tracer in uniquetracers) {
+
+    #Compute Errors
+    g_MSE = MSEfunc(results$Master$oos_predictions[Tracer == tracer])
+    g_SSE = SSEfunc1(results$Master$oos_predictions[Tracer == tracer])
+    g_SST = SSTfunc(results$Master$oos_predictions[Tracer == tracer])
+    g_R2  = 1 - (g_SSE / g_SST)
+    g_RMSE = sqrt(g_MSE)
+
+    individualErrorTable <- rbind(individualErrorTable, c(tracer, g_SSE, g_R2, g_RMSE))
+
+  }
+  colnames(individualErrorTable) <- c("Tracer", "SSE", "R^2", "RMSE")
+  print(as.matrix(individualErrorTable))
+}
+
+#Print entire set
+print(as.matrix(printables))
+
+#Compute average R^2 and RMSE OOS for all models
+if (!masterModel) {
+  paste("Model Method:", paste(modelMethod, ifelse(runOptimization, " (Optimized)", ""), sep = ""))
+  paste("Average SSE:", mean(printables$SSE, na.rm = TRUE))
+  paste("Average R^2:", mean(printables$R2, na.rm = TRUE))
+  paste("Average RMSE", mean(printables$RMSE, na.rm = TRUE))
+}
+
+```
+
+```{r}
+# #Set save directory
+# setwd(saveDirectory)
+# 
+# #Save the environment upon completion (takes a bit)
+# savePath <- paste(getwd(), "/result-KNITTED.Rdata", sep = "")
+# if(file.exists(savePath))
+#   file.remove(savePath)
+# save.image(savePath)
+
+#Scream for attention. Ideal when using MLR for forest after long wait times.
+print("Completed and Saved Successfully.")
+scream = FALSE
+#beep(10)
+while(scream) {
+  Sys.sleep(1)
+  #beep(10)
+}
+
+```
+

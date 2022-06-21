@@ -1,0 +1,115 @@
+---
+title: "Paramater Selection for Model Construction"
+author: "Hubert B. Majewski, Kennly Weerasinghe"
+date: "2/4/2022"
+output:
+  html_document: default
+  pdf_document:
+    latex_engine: xelatex
+---
+
+
+
+
+```{r}
+pacman::p_load(tidyverse, magrittr, skimr, mlr, data.table, dplyr, testthat, numbers, xgboost, ggplot2, cowplot, ggpubr, grid, gridExtra, glmnet, glmnetUtils)
+params = fread("newparamselect.csv") #Integral differences of the transport equations
+#skim(params)
+#str(params)
+#head(params)
+#print(params)
+
+corrParams <- params %>% select(Tracer, Ss, Molar_Volume, Density, Kow, Ksp, Vapor_Pressure, Fugacity, Kh, Tc, Pc, Vc, SPH)
+corrParamsLogged <- params %>% select(Tracer, Ss, Molar_Volume, Density, Kow, Ksp, Vapor_Pressure, Fugacity, Kh, Tc, Pc, Vc, SPH)
+paramNames <- colnames(corrParamsLogged %>% select(-Tracer))
+corrParamsLogged <- corrParamsLogged %>% select(-Tracer) %>% mutate_all(log)
+
+paraNamesLogged <- lapply(paramNames, function(x) {paste("Log_", x, sep = "")})
+colnames(corrParamsLogged) <- unlist(paraNamesLogged)
+#print(corrParamsLogged)
+
+corrLogged <- cbind(corrParams, corrParamsLogged)
+write.csv(cor(corrLogged %>% select(-Tracer)), "correlations_and_logged.csv")
+
+
+
+corrLogged <- fread("loglinearparams.csv")
+
+#KSP KOW & logs against everything respectively by feature
+features <- colnames(corrLogged %>% select(-Tracer, -Series))
+for(feature in features) {
+  
+  #Print out graph given feature
+  Series <- as.factor(corrLogged$Series)
+  EBp <- ggplot() +
+      #Measured
+      geom_point(data = corrLogged, aes(x = corrLogged[[feature]], y = corrLogged$Kow, color = Series)) +
+      geom_smooth(data = corrLogged, aes(x = corrLogged[[feature]], y = corrLogged$Kow), method = lm) + 
+      #Label
+      labs(title = paste(ifelse(TRUE, "Kow", ""), "Vs.", feature), x = 'Kow', y = feature) + 
+      theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+                         panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+  
+  print(EBp)
+
+  EBp <- ggplot() +
+      #Measured
+      geom_point(data = corrLogged, aes(x = corrLogged[[feature]], y = corrLogged$Ksp, color = Series)) +
+      geom_smooth(data = corrLogged, aes(x = corrLogged[[feature]], y = corrLogged$Ksp), method = lm) + 
+      #Label
+      labs(title = paste(ifelse(TRUE, "Ksp", ""), "Vs.", feature), x = 'Ksp', y = feature) +
+      theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+                         panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+  print(EBp)
+
+    #Print out graph given feature
+  EBp <- ggplot() +
+      #Measured
+      geom_point(data = corrLogged, aes(x = corrLogged[[feature]], y = corrLogged$Log_Kow, color = Series)) +
+      geom_smooth(data = corrLogged, aes(x = corrLogged[[feature]], y = corrLogged$Log_Kow), method = lm) + 
+      #Label
+      labs(title = paste(ifelse(TRUE, "Log_Kow", ""), "Vs.", feature), x = 'Log_Kow', y = feature) +
+      theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+                         panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+
+  print(EBp)
+
+  EBp <- ggplot() +
+      #Measured
+      geom_point(data = corrLogged, aes(x = corrLogged[[feature]], y = corrLogged$Log_Ksp, color = Series)) +
+      geom_smooth(data = corrLogged, aes(x = corrLogged[[feature]], y = corrLogged$Log_Ksp), method = lm) + 
+      #Label
+      labs(title = paste(ifelse(TRUE, "Log_Ksp", ""), "Vs.", feature), x = 'Log_Ksp', y = feature) +
+      theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+                         panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+  print(EBp)
+  
+  #lapply(graphsList, function(x) {print(x)})
+  #graphsList <- list()
+  
+}
+
+#Plot the duplicates against eachother
+plotData <- (fread("xgbfullparam.csv"))
+
+  EBp <- ggplot() +
+      #Measured
+      geom_line(data = plotData[Tracer == "tert-Butylbenzene"], aes(x = PV, y = Tracer_Conc, color = "Red")) +
+      geom_line(data = plotData[Tracer == "tert-Butylbenzene(2)"], aes(x = PV, y = Tracer_Conc, color = "Blue")) + 
+      #Label
+      labs(title = paste("tert-Butylbenzene", "Vs.", "tert-Butylbenzene(2)"), x = 'PV', y = "Tracer_Conc") + 
+      theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+                         panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+print(EBp)
+
+  EBp <- ggplot() +
+      #Measured
+      geom_line(data = plotData[Tracer == "Pentamethylbenzene"], aes(x = PV, y = Tracer_Conc, color = "Red")) +
+      geom_line(data = plotData[Tracer == "Pentamethylbenzene(2)"], aes(x = PV, y = Tracer_Conc, color = "Blue")) + 
+      #Label
+      labs(title = paste("Pentamethylbenzene", "Vs.", "Pentamethylbenzene(2)"), x = 'PV', y = "Tracer_Conc") + 
+      theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+                         panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+print(EBp)
+
+```

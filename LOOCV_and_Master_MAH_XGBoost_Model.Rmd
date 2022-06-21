@@ -1,0 +1,701 @@
+---
+title: "LOOCV R Model Generation, XGBOOST and OPTIMX"
+author: "Hubert B. Majewski, Kennly Weerasinghe"
+date: "8/1/2021"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+#Load libraries
+pacman::p_load(tidyverse, magrittr, gdata, skimr, pracma, data.table, testthat, numbers, xgboost, mlr, optimx, parallel, parallelMap, doParallel, doSNOW, foreach, beepr)
+
+#Set memory limitations
+memory.limit(size = 32 * 1024 + 64 * 1024) # Where 64 is paging file size in GB
+
+#Set the current working directory (to pull data etc.)
+#setwd("D:\\Archived Downloads\\rstudio")
+
+#Set read directory
+readDirectory <- getwd()
+
+#Set save directory (normally the current directory)
+saveDirectory <- getwd()
+
+#Get number of processor threads for RStudio to use when executing MLR, generating models, or other of R's internals
+cores <- ifelse(is.na(detectCores()) || detectCores() < 2, 3 - 1, detectCores() - 2)
+
+#Project modeling control flags
+transformFunction = TRUE #Apply transformations
+runOptimization = FALSE # For linear model to enforce monotonicity
+masterModel = FALSE #Use entire dataset to create a model
+#modelMethod = "linear" #"Linear" for Optimx or Xgboost's "Forest"
+modelMethod = "forest"
+
+#Pull data
+xgb <- data.table(fread("xgbtimeplusco_mw.csv"))
+
+#xgb <- xgb[, lapply(.SD, function(x) {ifelse(is.nan(x), 0, x)})]
+#xgb <- xgb[, lapply(.SD, function(x) {ifelse(is.infinite(x) & x > 0, 100^300, x)})]
+#xgb <- xgb[, lapply(.SD, function(x) {ifelse(is.infinite(x) & x < 0, -100^300, x)})]
+
+#Minimum columns needed to be present
+if (is.null(xgb$Tracer) | is.null(xgb$PV) | is.null(xgb$Ogata) | is.null(xgb$Tracer_Conc) | is.null(xgb$Time)) #All five are the minimum that needs to be present for this code to run
+  stop("The following features must be provided: \n Tracer, Tracer_Conc, Ogata, Time, PV")
+
+#Reogranize columns
+xgb <- xgb %>% relocate(any_of(c("Tracer", "Tracer_Conc", "Time", "PV", "Ogata")))
+
+#Remove trailing whitespace from tracer names
+xgb[, Tracer := trim(Tracer)]
+
+#Set default transformation function (keep original data)
+transformation <- function(x) {return (x)}
+inverseTransformation <- function(x) {return (x)}
+if (transformFunction) {
+  
+  #Case to prevent undefined when values are 1 for transformation function
+  MAX_CONC = xgb[Tracer_Conc < 1 & Ogata < 1, .(Tracer_Conc, Ogata)] %>% as.matrix %>% max
+  MIN_CONC = 1 - MAX_CONC
+  #Recode 1's as a large number close to 1 same with 0 for transformation
+  xgb[Tracer_Conc == 1, Tracer_Conc := MAX_CONC]
+  xgb[Ogata == 1,       Ogata := MAX_CONC]
+  xgb[Tracer_Conc == 0, Tracer_Conc := MIN_CONC]
+  xgb[Ogata == 0,       Ogata := MIN_CONC]
+  
+  #Define the transformation function
+  transformation <- function(x) {
+    x <- replace(x, x == 1, MAX_CONC)
+    x <- replace(x, x == 0, MIN_CONC)
+    ans <- log(x / (1 - x))
+    return (ans)
+  }
+  inverseTransformation <- function(x) {
+    x <- replace(x, x > 500, 500)
+    ans <- exp(x) / (1 + exp(x))
+    return (ans)
+  }
+  
+  #Transform concentrations for predictions
+  xgb[, Tracer_Conc := transformation(Tracer_Conc)]
+  xgb[, Ogata :=       transformation(Ogata)]
+  
+}
+
+#Deterministic seed
+RandomSeed <- 65535
+set.seed(RandomSeed)
+```
+
+```{r}
+#Benchmarking
+startTime <- Sys.time()
+endTime <- NULL
+
+#Error functions
+SSEfunc1 <- function(data) {
+  data <- data.table(Time=data$Time, Pred=data$Pred, Tracer_Conc=data$Tracer_Conc)
+  #data[, Tracer_Conc := inverseTransformation(Tracer_Conc)]
+  
+  #g_SSE <- sum((
+  #  inverseTransformation(y_test) - inverseTransformation(oos_predictions[[tracer]]$Pred)
+  #) ^ 2)
+  
+  #Enforce order by time incase aded by groups of tracers (out of order)
+  data <- data[order(data$Time), ]
+  
+  #Replace any NA's with 0s
+  #ret[, Pred := ifelse(is.nan(Pred) | is.na(Pred), 0, Pred)]
+  
+  #Compute SSE for each tracer group at each point
+  data[, error := (
+    as.numeric(Tracer_Conc) - as.numeric(Pred)
+    #or
+    #((as.numeric(Tracer_Conc) - as.numeric(shift(Tracer_Conc, fill = 0))) / 2 * (as.numeric(Time) - as.numeric(shift(Time, fill = 0))))
+    #- ((as.numeric(Pred) - as.numeric(shift(Pred, fill = 0))) / 2 * (as.numeric(Time) - as.numeric(shift(Time, fill = 0))))
+    #or
+    #((as.numeric(Tracer_Conc) - as.numeric(shift(Tracer_Conc, fill = 0))) / (as.numeric(Time) - as.numeric(shift(Time, fill = 0)))) 
+    #                                               * (as.numeric(Time) - as.numeric(shift(Time, fill = 0))) + as.numeric(shift(Tracer_Conc, fill = 0))
+    #- (as.numeric(Pred) - as.numeric(shift(Pred, fill = 0))) / (as.numeric(Time) - as.numeric(shift(Time, fill = 0)))
+    #                                                * (as.numeric(Time) - as.numeric(shift(Time, fill = 0))) + as.numeric(shift(Tracer_Conc, fill = 0))
+    
+  ) ^ 2 * (as.numeric(Time) - shift(Time, fill = 0))]
+  
+  return(sum(data$error))
+  
+}
+
+SSEfunc3 <- function(data) {
+  data <- data.table(Time=data$Time, Pred=data$Pred, Tracer_Conc=data$Tracer_Conc)
+  data[,Tracer_Conc := (Tracer_Conc)]
+  
+  #Enforce order by time incase aded by groups of tracers (out of order)
+  data <- data[order(data$Time), ]
+  
+  #Uniform times
+  dt <- 0.1
+  times <- seq(from = 0, to = as.numeric(max(data$Time)), by = dt)
+  
+  #For each point compute the prediction
+  error = 0
+  for(x in times) {
+    x1 <- data[Time < x, ]
+    if (nrow(x1) == 0) {
+      y1 <- 0
+      yhat1 <- 0
+      x1 <- 0
+    } else {
+      x1 <- x1[length(x1), ]
+      y1 <- x1$Tracer_Conc
+      yhat1 <- x1$Pred
+      x1 <- x1$Time
+    }
+    
+    x2 <- data[Time >= x, ]
+    if (nrow(x2) == 0) { #Done, no more points on right 
+      break
+    } else {
+      x2 <- x2[1, ]
+      y2 <- x2$Tracer_Conc
+      yhat2 <- x2$Pred
+      x2 <- x2$Time
+    }
+    
+    Pred <- (yhat2 - yhat1) / (x2 - x1) * (x - x2) + yhat2
+    Conc <- (y2 - y1) / (x2 - x1) * (x - x2) + y2
+    
+    error <- error + ifelse(is.na((Conc - Pred) ^ 2 * dt), 0, (Conc - Pred) ^ 2 * dt)
+  }
+  
+  return(error)
+  
+}
+
+MSEfunc <- function(data) {
+  data <- data.table(Time=data$Time, Pred=data$Pred, Tracer_Conc=data$Tracer_Conc)
+  data[,Tracer_Conc := (Tracer_Conc)]
+  
+  #g_MSE <-
+  #mean((
+  #  inverseTransformation(y_test) - inverseTransformation(oos_predictions[[tracer]]$Pred)
+  #) ^ 2)
+  
+  #Enforce order by time incase added by groups of tracers (out of order)
+  data <- data[order(data$Time), ]
+  
+  #Uniform times
+  dt <- 0.1
+  times <- seq(from = 0, to = as.numeric(max(data$Time)), by = dt)
+  
+  #For each point compute the prediction
+  total = 0
+  error = 0
+  for(x in times) {
+    x1 <- data[Time < x, ]
+    if (nrow(x1) == 0) {
+      y1 <- 0
+      yhat1 <- 0
+      x1 <- 0
+    } else {
+      x1 <- x1[length(x1), ]
+      y1 <- x1$Tracer_Conc
+      yhat1 <- x1$Pred
+      x1 <- x1$Time
+    }
+    
+    x2 <- data[Time >= x, ]
+    if (nrow(x2) == 0) { #Done, no more points on right 
+      break
+    } else {
+      x2 <- x2[1, ]
+      y2 <- x2$Tracer_Conc
+      yhat2 <- x2$Pred
+      x2 <- x2$Time
+    }
+    
+    Pred <- (yhat2 - yhat1) / (x2 - x1) * (x - x2) + yhat2
+    Conc <- (y2 - y1) / (x2 - x1) * (x - x2) + y2
+    
+    error <- error + ifelse(is.na((Conc - Pred) ^ 2 * dt), 0, (Conc - Pred) ^ 2 * dt)
+    total <- total + 1
+  }
+  
+  return(error / total)
+  
+}
+
+SSTfunc <- function(data) {
+  data <- data.table(Time=data$Time, Pred=data$Pred, Tracer_Conc=data$Tracer_Conc)
+  data[,Tracer_Conc := (Tracer_Conc)]
+  
+  #g_SST <-
+  #sum((
+  #  inverseTransformation(y_test) - mean(inverseTransformation(y_test))
+  #) ^ 2)
+  
+  #Enforce order by time incase added by groups of tracers (out of order)
+  data <- data[order(data$Time), ]
+  
+  #Uniform times
+  dt <- 0.1
+  times <- seq(from = 0, to = as.numeric(max(data$Time)), by = dt)
+  
+  #For each point compute the prediction
+  error = 0
+  total = 0
+  Pred = 0
+  Conc <- as.vector(x = 0, mode = "numeric")
+  for(x in times) {
+    x1 <- data[Time < x, ]
+    if (nrow(x1) == 0) {
+      y1 <- 0
+      yhat1 <- 0
+      x1 <- 0
+    } else {
+      x1 <- x1[length(x1), ]
+      y1 <- x1$Tracer_Conc
+      yhat1 <- x1$Pred
+      x1 <- x1$Time
+    }
+    
+    x2 <- data[Time >= x, ]
+    if (nrow(x2) == 0) { #Done, no more points on right 
+      break
+    } else {
+      x2 <- x2[1, ]
+      y2 <- x2$Tracer_Conc
+      yhat2 <- x2$Pred
+      x2 <- x2$Time
+    }
+    
+    Pred <- Pred + ifelse(is.na((yhat2 - yhat1) / (x2 - x1) * (x - x2) + yhat2) , 0, (yhat2 - yhat1) / (x2 - x1) * (x - x2) + yhat2)
+    Conc <- append(Conc, (y2 - y1) / (x2 - x1) * (x - x2) + y2)
+    total <- total + 1
+  }
+  Pred <- Pred / total
+  error <- sapply(Conc, function(x) {ifelse(is.na((x - Pred) ^ 2 * dt), 0, (x - Pred) ^ 2 * dt)})
+  
+  return(sum(error))
+  
+}
+```
+
+```{r}
+#Setup tuning hyperparameters using MLR for XGBoost Forest
+
+if(modelMethod == "Forest" || modelMethod == "forest") {
+  #MLR hyper-tuning setup for XGBoost (https://rstudio-pubs-static.s3.amazonaws.com/336732_52d1b0e682634b5eae42cf86e1fc2a98.html)
+  parmsList <- list(
+    booster = 'dart',
+    tree_method = 'exact',
+    monotone_constraints = c(1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0), #Monotone constraint (result should be monotone)
+    objective = 'reg:squarederror',
+    eval_metric = 'rmse',
+    predictor = 'cpu_predictor' #Use gpu_predictor if possible; much faster. XGBoost needs to be compiled with GPU support which is not available at the time of this project.
+  )
+  
+  #Parameters to tune
+  bound <- 16 #30 Must be an Integer.
+  xgb_params <- makeParamSet(
+    makeIntegerParam("nrounds", lower = 2, upper = 2 *  bound),
+    makeIntegerParam("max_depth", lower = 2, upper = bound), # As a tree, higher values can cause exponential process for generation
+    makeNumericParam("eta", lower = 0, upper = 1),
+    makeNumericParam("gamma", lower = 0, upper = 1),
+    makeNumericParam("base_score", lower = 0, upper = 1),
+    makeIntegerParam("max_leaves", lower = 2, upper = 2 ^ bound),
+    makeIntegerParam("max_bin", lower = 2, upper= 2 ^ bound),
+    makeNumericParam("sketch_eps", lower = 0, upper= 1),
+    makeDiscreteParam("sample_type", values = c('uniform', 'weighted')),
+    makeDiscreteParam("grow_policy", values = c('depthwise','lossguide')),
+    makeNumericParam("max_delta_step", lower= 0, upper = 2 ^ bound),
+    #Dart
+    makeNumericParam("subsample", lower = 0, upper = 1),
+    makeNumericParam("skip_drop", lower = 0, upper = 1),
+    makeNumericParam("rate_drop", lower = 0, upper = 1),
+    makeLogicalParam("one_drop")
+  )
+  xgb_control <- makeTuneControlRandom(maxit = bound)
+  xgb_resample_desc <- makeResampleDesc("CV", iters = floor(bound/2)) # Try to LOO in final
+  xgb_learner <- makeLearner("regr.xgboost", predict.type = "response", par.vals = parmsList)
+  
+}
+```
+
+```{r}
+#Setup for optimx function in linear model
+if (modelMethod == "Linear" || modelMethod == "linear") {
+  
+  #Function
+  optimFunc <-
+    function(par, xgbOptimxData, lm_model, SSEIntfunc, transformFunc, original_model, dtFeatures, loess_model) {
+      
+      #Remove ':' from all
+      names(par) <- lapply(names(par), function (x) {gsub(':', '', x)})
+      
+      #Every feature dt... compute sum
+      xgbOptimxData[, dtSum := 0]
+      for(dtvar in dtFeatures) {
+        
+        #Coef(feature) * dt(feature)
+        #xgbOptimxData[, dtvar := ifelse(!is.finite(dtvar), 10^300, dtvar)] #Coerce to finite value if infinite
+        xgbOptimxData[, dtSum := as.numeric(dtSum) + as.numeric(par[gsub("dt", "", dtvar)]) * as.numeric(get(dtvar))]
+        
+      }
+      
+      # print(any(is.na(xgbOptimxData$dtSum)))
+      # print(any(is.nan(xgbOptimxData$dtSum)))
+      # print(all(is.finite(xgbOptimxData$dtSum), na.rm = T))
+      # print(any(is.infinite(xgbOptimxData$dtSum) & xgbOptimxData$dtSum < 0, na.rm = T))
+      # print(any(is.infinite(xgbOptimxData$dtSum) & xgbOptimxData$dtSum > 0, na.rm = T))
+      
+      #Replace coefficients and predict
+      lmnames <- names(lm_model$coefficients)
+      lm_model$coefficients <- par
+      names(lm_model$coefficients) <- lmnames
+      
+      #Compute SSE (Not un-transformed SSE's translate to a value up to 10^100!)
+      dataset <-
+        list(
+          "Tracer_Conc" = as.vector((predict(original_model, xgbOptimxData)), mode = "numeric"),
+          "Pred" = as.vector((predict(g_mod, xgbOptimxData)), mode = "numeric"),
+          "Tracer" = xgbOptimxData$Tracer,
+          "Time" = as.vector(xgbOptimxData$Time, mode = "numeric")
+          #"loess_y_mod" = loess((Tracer_Conc) ~ Time, xgbOptimxData),
+          #"loess_pred_mod" = loess(as.vector((predict(g_mod, xgbOptimxData)), mode = "numeric") ~ Time, xgbOptimxData)
+        )
+      SSEInternal <- SSEIntfunc(dataset)
+      #SSEIntfunc(xgbOptimxData, loess_model, par)
+      
+      #If it is not monotonic, make the SSE look worse with respect to how many are not monotonic
+      beforeSSE <- SSEInternal
+      #if (!all(xgbOptimxData$dtSum > 0)) {
+      if (any(xgbOptimxData$dtSum <= 0)) {
+        #Not monotonic 
+        SSEInternal <- 
+          10 ^ 300
+        #(SSEInternal + 100) ^ (
+        #  (1 + 15
+        #* (sum(xgbOptimxData$dtSum <= 0) / length(xgbOptimxData$dtSum)) #Multiply by the number of points whose slope is 0?
+        #* (sum(abs(xgbOptimxData[dtSum <= 0]$dtSum)) / sum(abs(xgbOptimxData$dtSum))) #Multiply by magnitude of the derivatives that are negative?
+        #  )
+        #)
+      }
+      
+      #Fix if Na, NAN, NULL, or Inf as whole 
+      #if(is.na(SSEInternal) | is.nan(SSEInternal) | is.null(SSEInternal) | SSEInternal == Inf) { # Cannot set to check for monotonic here as the original bvec is not monotonic itself. Optim will not know where to go.
+      #print("NA/NAN/NULL/Inf Computed! Using Double.max")
+      #  SSEInternal <- .Machine$double.xmax #Not infinity. Just a massive constant
+      #}
+      
+      print(c(beforeSSE, SSEInternal, sum(is.na(xgbOptimxData$dtSum)),  sum(is.nan(xgbOptimxData$dtSum))))
+      
+      #It should be numeric anyway
+      return (SSEInternal)
+    }
+}
+```
+
+```{r}
+#LOO by Tracer
+uniquetracers = unique(xgb$Tracer)
+
+if (masterModel) {
+  uniquetracers <- c("Master")
+}
+
+results = list()
+coreCluster <- makeCluster(cores, outfile="")
+registerDoSNOW(coreCluster)
+textProgressBar <- txtProgressBar(max=length(uniquetracers), style = 3)
+progressBar <- list(progress = function(n) setTxtProgressBar(textProgressBar, n))
+results = foreach(tracer = uniquetracers, .combine = c, .init = NULL, .packages = .packages(), .inorder = TRUE, .multicombine = TRUE, .verbose = F, .options.snow = progressBar) %dopar% #dopar
+  #for (tracer in uniquetracers)
+  {
+    #Pass down randomization seed into independant processes
+    set.seed(RandomSeed)
+    
+    #Train and Test
+    #LOO Split via tracer
+    if (masterModel) {
+      x_train = xgb
+      x_test = xgb
+    } else {
+      x_train = xgb[Tracer != tracer, ]
+      x_test = xgb[Tracer == tracer, ]
+    }
+    y_train = x_train$Tracer_Conc
+    y_test = x_test$Tracer_Conc
+    
+    x_train_PV <- x_train$PV
+    x_test_PV <- x_test$PV
+    x_train  =  x_train %>% select(-PV)
+    x_test  =  x_test %>% select(-PV)
+    
+    #Mutate to remove tracer_conc as an independent vector
+    x_train  =  x_train %>% select(-Tracer_Conc)
+    x_test  =  x_test %>% select(-Tracer_Conc)
+    x_train  =  x_train %>% select(-Ogata)
+    x_test  =  x_test %>% select(-Ogata)
+    
+    if (modelMethod == "Forest" || modelMethod == "forest") {
+      
+      #Create XGBoost frames for modeling
+      dtrain =
+        xgb.DMatrix(data = as.matrix(x_train[ , !"Tracer"]), label = y_train)
+      dtest =
+        xgb.DMatrix(data = as.matrix(x_test[ , !"Tracer"]), label = y_test)
+      
+      #MLR tune the parameters in parallel ("socket" for windows, "multicore" for unix)
+      #If there's an error here, restart R and run again.
+      #parallelStart(mode="socket", cpus = cores, level="mlr.tuneParams") # dont run in parallel if already running in parallel
+      xgb_tuned_parms = tuneParams(
+        learner = xgb_learner,
+        task = makeRegrTask(data = data.frame(cbind(x_train[, !"Tracer"], Tracer_Conc = y_train)), target = "Tracer_Conc"),
+        resampling = xgb_resample_desc,
+        par.set = xgb_params,
+        control = xgb_control,
+        measure = list(rmse)
+      )
+      #parallelStop()
+      
+      #Create Forest Model
+      g_mod = xgb.train(
+        data = dtrain,
+        watchlist = list(val = dtest, train = dtrain),
+        #nthread = cores,
+        
+        #Tuned
+        nrounds = xgb_tuned_parms$x$nrounds,
+        params = append(xgb_tuned_parms$x[2:length(xgb_tuned_parms$x)], parmsList),
+        
+        #Debugging Parms
+        verbose = 0
+      )
+      g_mod$params <- prepend(g_mod$params, list(nrounds = xgb_tuned_parms$x$nrounds))
+      
+      #By definition of the forest model, it is monotonic.
+      monotonic = TRUE
+      
+      #Save predictions for the current tracer not of all tracers
+      is_predictions =
+        data.table(
+          "Tracer_Conc" = as.vector(inverseTransformation(y_train), mode= "numeric"),
+          "Pred" = as.vector(inverseTransformation(predict(g_mod, dtrain)), mode= "numeric"),
+          "Tracer" = x_train$Tracer,
+          "Time" = as.vector(x_train$Time, mode= "numeric"),
+          "PV" = as.vector(x_train_PV, mode= "numeric")
+        )
+      oos_predictions =
+        data.table(
+          "Tracer_Conc" = as.vector(inverseTransformation(y_test), mode= "numeric"),
+          "Pred" = as.vector(inverseTransformation(predict(g_mod, dtest)), mode= "numeric"),
+          "Tracer" = x_test$Tracer,
+          "Time" = as.vector(x_test$Time, mode= "numeric"),
+          "PV" = as.vector(x_test_PV, mode= "numeric")
+        )
+      
+      #Not used but defined as empty
+      optimxbvec = list()
+      optimxRes = list()
+      
+    } else if (modelMethod == "Linear" || modelMethod == "linear") {
+      
+      #Get initial coefficients
+      g_mod = lm(y_train ~ 
+                   (Time) * 
+                   (Ogata) *
+                   (A + Y + K + P + G + H + C + Q + W + J + S + R),
+                 x_train[, c("Time", "Se", "Ss", "ARR", "Molar_Volume", "Le_Bas", "Boiling_Point", "Density", "Ksp", "Vapor_Pressure", "Fugacity", "Kh", "Tc", "Pc", "Vc", "W3D", "J3D", "H3D", "AGDD", "DDI", "ADDD", "SPH", "ASP", "Polarity_index")])
+      
+      #Get optimx coefficients as absolutes to force monotonicity
+      g_modNames <- names(g_mod$coefficients)
+      optimxbvec = as.vector(g_mod$coefficients, mode = "numeric")
+      names(optimxbvec) <- g_modNames
+      
+      #Derivatives Dataset
+      xgbOptimxData = data.table(x_train %>% mutate(Tracer_Conc = y_train))
+      dtFeatures = list("dtTimeOgata", "dtTimeA", "dtTimeY", "dtTimeK", "dtTimeP", "dtTimeG", "dtTimeH", "dtTimeC", "dtTimeQ", "dtTimeW", "dtTimeJ", "dtTimeS", "dtTimeR", "dtOgataA", "dtOgataY", "dtOgataK", "dtOgataP", "dtOgataG", "dtOgataH", "dtOgataC", "dtOgataQ", "dtOgataW", "dtOgataJ", "dtOgataS", "dtOgataR", "dtTimeOgataA", "dtTimeOgataY", "dtTimeOgataK", "dtTimeOgataP", "dtTimeOgataG", "dtTimeOgataH", "dtTimeOgataC", "dtTimeOgataQ", "dtTimeOgataW", "dtTimeOgataJ", "dtTimeOgataS", "dtTimeOgataR") #Intersection is the same as first list
+      
+      #Run Optimx
+      if (runOptimization) {
+        optimxRes = 
+          
+          #Both Optimx and OptimParallel work. (Use $par when using optimParallel)
+          #https://rdrr.io/rforge/optplus/man/optimx.html
+          optimx(
+            par = optimxbvec,
+            xgbOptimxData = xgbOptimxData,
+            lm_model = g_mod,
+            SSEIntfunc = SSEfunc1,
+            transformFunc = inverseTransformation,
+            dtFeatures = dtFeatures,
+            original_model = g_mod,
+            loess_model = loess_model,
+            fn = optimFunc,
+            #gr = NULL, #NULL uses a default func for gradient based methods
+            method = "Nelder", #Results for "L-BFGS-B" should always be finite
+            control = list(maxit = 1000, # The higher the iterations, the better the monotonic approximation
+                           trace = 0, #Debug
+                           dowarn = TRUE #Debug
+                           #ndeps = as.vector(rep(10 ^ 3, times = length(optimxbvec)), mode = "numeric"),
+                           #parscale =  as.vector(c((10 ^ -2), rep(10 ^ -2, times = length(optimxbvec) - 1)), mode = "numeric")
+                           #fnscale = abs(10 ^ 3),
+                           #abstol = abs(10 ^ -8)
+                           #reltol = 10 ^ -3
+            )
+          )
+        
+        #A check to make sure the result is different
+        #if(setequal(data.table(optimxRes), data.table(optimxbvec)))
+        #print("Same vector results produced by optim")
+        
+      } else {
+        optimxRes = as.vector(optimxbvec, mode="numeric")
+      }
+      optimxRes <- as.vector(optimxRes[1:length(optimxbvec)], mode = "numeric")
+      names(optimxRes) = lapply(names(optimxbvec), function (x) {gsub(':', '', x)}) #Remove ':' from all names names(optimxbvec)
+      
+      
+      #Check monotonically
+      monotonic = FALSE
+      if (runOptimization) {
+        xgbOptimxData[, dtSum := 0]
+        for(dtvar in dtFeatures) {
+          #Coef(feature) * dt(feature)
+          #xgbOptimxData[, dtvar := ifelse(!is.finite(dtvar), 10^300, dtvar)] #Coerce to finite value
+          xgbOptimxData[, dtSum := as.numeric(dtSum) + as.numeric(par[gsub("dt", "", dtvar)]) * as.numeric(get(dtvar))]
+        }
+        
+        if(all(xgbOptimxData$dtSum > 0)) {
+          monotonic = TRUE
+        }
+      }
+      
+      #Set lm model with the weights
+      g_mod$coefficients <- optimxRes
+      names(g_mod$coefficients) <- g_modNames
+      
+      #Save predictions for the current tracer not of all tracers
+      is_predictions =
+        data.table(
+          "Tracer_Conc" = as.vector(inverseTransformation(y_train), mode= "numeric"),
+          "Pred" = as.vector(inverseTransformation(predict(g_mod, x_train[ , !"Tracer"])), mode= "numeric"),
+          "Tracer" = x_train$Tracer,
+          "Time" = as.vector(x_train$Time, mode= "numeric"),
+          "PV" = as.vector(x_train_PV, mode= "numeric")
+          #"loess_y_mod" = loess((y_train) ~ Time, x_train),
+          #"loess_pred_mod" = loess(as.vector((predict(g_mod, x_train[ , !"Tracer"])), mode= "numeric") ~ Time, x_train)
+        )
+      oos_predictions =
+        data.table(
+          "Tracer_Conc" = as.vector(inverseTransformation(y_test), mode= "numeric"),
+          "Pred" = as.vector(inverseTransformation(predict(g_mod, x_test[ , !"Tracer"])), mode= "numeric"),
+          "Tracer" = x_test$Tracer,
+          "Time" = as.vector(x_test$Time, mode= "numeric"),
+          "PV" = as.vector(x_train_PV, mode= "numeric")
+          #"loess_y_mod" = loess((y_test) ~ Time, x_test),
+          #"loess_pred_mod" = loess(as.vector((predict(g_mod, x_test[ , !"Tracer"])), mode= "numeric") ~ Time, x_test)
+        )
+      
+      #g_SSE = SSEfunc4(data.table(x_train %>% mutate(Tracer_Conc = y_train)), loess_model, g_mod$coefficients)
+    } # if forest/linear
+    
+    #Compute Errors
+    g_MSE = MSEfunc(oos_predictions)
+    g_SSE = SSEfunc1(oos_predictions)
+    IS_g_SSE = SSEfunc1(is_predictions)
+    g_SST = SSTfunc(oos_predictions)
+    g_R2  = 1 - (g_SSE / g_SST)
+    g_RMSE = sqrt(g_MSE)
+    
+    #Save metrics
+    R2   = g_R2
+    SSE = g_SSE
+    RMSE = g_RMSE
+    MSE  = g_MSE
+    
+    #Add model to the list of models made for each tracer dynamically
+    models = g_mod
+    
+    #Return computations for tracer
+    results = ifelse(!exists("results"), list(), results)
+    results[[tracer]] = list(Tracer = tracer, R2 = R2, SSE = SSE, IS_SSE = IS_g_SSE, RMSE = RMSE, MSE = MSE, model = g_mod, is_predictions = is_predictions, oos_predictions = oos_predictions, optimxbvec = optimxbvec, optimxRes = optimxRes, monotonic = monotonic) #, x_test_cpy = x_test_cpy, x_train_cpy = x_train_cpy, y_test_cpy = y_test_cpy, y_train_cpy = y_train_cpy)
+    
+    #Cleanup unused data as it is saved. Reduces a lot of memory usage 
+    rm("is_predictions", "oos_predictions", "x_test", "x_train", "y_test", "y_train")
+    invisible(gc())
+    
+    return(results)
+  } # for tracer
+close(textProgressBar)
+stopCluster(coreCluster)
+
+
+#Benchmark
+endTime = Sys.time()
+print(paste("Runtime:", (endTime - startTime), sep = " "))
+
+#Cleanup
+gc()
+```
+
+```{r}
+#Undo transformations for comparison
+if(modelMethod == "Forest" || modelMethod == "forest") {
+  
+  xgb[, Tracer_Conc := inverseTransformation(Tracer_Conc)]
+  xgb[, Ogata :=       inverseTransformation(Ogata)]
+  
+} else if (modelMethod == "Linear" || modelMethod == "linear") {
+  
+  xgb[, Tracer_Conc := inverseTransformation(Tracer_Conc)]
+  xgb[, Ogata :=       inverseTransformation(Ogata)]
+
+}
+
+```
+
+```{r, eval = TRUE}
+#Set save directory
+setwd(saveDirectory)
+
+#Save the environment upon completion (takes a bit)
+savePath <- paste(getwd(), "/result.Rdata", sep = "")
+if(file.exists(savePath))
+  file.remove(savePath)
+save.image(savePath)
+
+#Save all of the models created
+savePath <- paste(getwd(), "/models/", sep = "")
+if (!dir.exists(savePath)) dir.create(savePath)
+for (tracer in uniquetracers) {
+  if (modelMethod == "Forest" || modelMethod == "forest") {
+    savePath <- paste(getwd(), "/models/", trim(tracer), ".XGBModel", sep = "")
+    
+    if (file.exists(savePath))
+      file.remove(savePath)
+    
+    xgb.save(results[[tracer]]$model, savePath)
+  } else { 
+    savePath <- paste(getwd(), "/models/", tracer, ".LM", sep = "")
+    
+    if (file.exists(savePath))
+      file.remove(savePath)
+    
+    sink(savePath)
+    print(results[[tracer]]$model)
+    sink()
+  }
+}
+
+#Scream for attention. Ideal when using MLR for forest after long wait times.
+print("Completed and Saved Successfully.")
+scream = FALSE
+beep(10)
+while((modelMethod == "Forest" || modelMethod == "forest") && scream) {
+  Sys.sleep(1)
+  beep(10)
+}
+
+```

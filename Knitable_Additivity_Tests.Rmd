@@ -1,0 +1,220 @@
+---
+title: "LOOCV R Model Generation, XGBOOST and OPTIMX"
+author: "Hubert B. Majewski, Kennly Weerasinghe"
+date: "8/1/2021"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+#Load libraries
+pacman::p_load(tidyverse, data.table, dplyr, testthat, numbers, ggplot2, scales, grid, gridExtra, cowplot, ggpubr, xgboost, ICEbox, ICE, vip, pdp, caret, SHAPforxgboost, fastshap, shapvis, h2o, parallel, parallelMap, doParallel, doSNOW, foreach) # iml package?
+
+#Set memory limitations
+#memory.limit(size = 32 * 1024 + 64 * 1024) # Where 64 is paging file size in GB
+
+#Set the current working directory (to pull data etc.)
+setwd("./")
+
+#Set load directory
+loadDirectory <- getwd()
+
+#Load the data
+loadPath <- paste(loadDirectory, "/result.Rdata", sep = "")
+load(loadPath)
+
+#Setup parallel processing (for graphs)
+if (cores == 2) cores = 7
+coreCluster <- parallel::makeCluster(cores, outfile="")
+doParallel::registerDoParallel(coreCluster, cores = cores)
+
+#Disable warnings for knit
+defaultWarnings <- getOption("warn")
+options(warn = -1)
+
+```
+
+```{r}
+#For each tracer, print the prediction that was out of sample
+#NOTE: All variables represented as "Time" are PV within the model output
+uniquetracers <- unique(xgb$Tracer)
+features <- results[["Master"]]$model$feature_names
+
+source("additivityLineup.R")
+source("backfitter.R")
+
+# Additivity
+if (modelMethod == "forest" || modelMethod == "Forest") {
+  
+  X = (xgb[, !"Tracer"])
+  y = xgb$Tracer_Conc
+  X = (X[, ..features])
+  
+  model <- results[["Master"]]$model
+  
+  #With feature scaling
+  X_std = scale(x = X, center = TRUE, scale = T)
+  X_center = attributes(X_std)$`scaled:center`
+  X_scale = attributes(X_std)$`scaled:scale`
+  
+  fitter <- function(X,y) {
+    #Setup MLR stuff (From master model because running MLR 20 * 19 times takes too long for little differences in tuning)
+    xgb_tuned_parms <- list()
+    xgb_tuned_parms$x <- results[["Master"]]$model$params
+    
+    #Without feature
+    X_std_noFeature = scale(x = X, center = TRUE, scale = T)
+    X_center_noFeature = attributes(X_std_noFeature)$`scaled:center`
+    X_scale_noFeature = attributes(X_std_noFeature)$`scaled:scale`
+    
+    X_std = scale(X, center = X_center_noFeature, scale = X_scale_noFeature)
+    #Create xgboost version
+    xgb.train(
+      data = xgb.DMatrix(data = as.matrix(X), label = as.vector(y)),
+      #watchlist = list(val = dtest, train = dtrain),
+      #Tuned
+      nrounds = xgb_tuned_parms$x$nrounds,
+      params = xgb_tuned_parms$x[2:length(xgb_tuned_parms$x)],
+      verbose = 0
+    )
+  }
+  
+  fitter2 <- function(X,y) {
+    #Setup MLR stuff (From master model because running MLR 20 * 19 times takes too long for little differences in tuning)
+    xgb_tuned_parms <- list()
+    xgb_tuned_parms$x <- results[["Master"]]$model$params
+    
+    X_std = scale(X, center = X_center, scale = X_scale)
+    #Create xgboost version
+    xgb.train(
+      data = xgb.DMatrix(data = as.matrix(X), label = as.vector(y)),
+      #watchlist = list(val = dtest, train = dtrain)
+      #Tuned
+      nrounds = xgb_tuned_parms$x$nrounds,
+      params = xgb_tuned_parms$x[2:length(xgb_tuned_parms$x)],
+      verbose = 0
+    )
+  }
+  
+  predictor <- function(object, newdata){ #for backfitting, one col removed from std
+    
+    #Without feature
+    X_std_noFeature = scale(x = newdata, center = TRUE, scale = T)
+    X_center_noFeature = attributes(X_std_noFeature)$`scaled:center`
+    X_scale_noFeature = attributes(X_std_noFeature)$`scaled:scale`
+    
+    X_std = scale(newdata, center = X_center_noFeature, scale = X_scale_noFeature)
+    dataset <- xgb.DMatrix(data = as.matrix(newdata), label = rep(0,
+                                                                  nrow(newdata)))
+    predict(object, dataset)
+  }
+  
+  predictor2 <- function(object, newdata){
+    X_std = scale(newdata, center = X_center, scale = X_scale)
+    dataset <- xgb.DMatrix(data = as.matrix(newdata), label = rep(0,
+                                                                  nrow(newdata)))
+    predict(object, dataset)
+  }
+  
+  SampledDataset <- cbind(xgb[, !"Tracer"], Y = xgb$Tracer_Conc) # For time split only
+  for(feat in features) { #Time requires 37GB of ram for a vector.....
+
+    if(feat == "Time") {
+
+      #Set randomization seed
+      set.seed(65535)
+
+      # Split Data into Training and Testing in R
+      sample_size = ceiling(0.25 * nrow(SampledDataset))
+      # randomly split data in r
+      picked = sample(seq_len(nrow(SampledDataset)), size = sample_size)
+      maxTime <- SampledDataset[which.max(SampledDataset$Time), ]
+      SampledDataset = rbind(SampledDataset[picked,], maxTime)
+    }
+    SampledDataset[, Tracer_Conc := NULL]
+    SampledDataset[, PV := NULL]
+    SampledDataset[, Ogata := NULL]
+
+    if (masterModel) {
+      ForestICEPlot <- invisible(ICEbox::ice(object =
+                                               results[["Master"]]$model, X = SampledDataset[, -("Y")], y =
+                                               SampledDataset$Y, predictor = feat, predictfcn = predictor2))
+    } else {
+      ForestICEPlot <- invisible(ICEbox::ice(object =
+                                               results[[tracer]]$model, X = dataset, y = datasetY, predictor = feat,
+                                             predictfcn = predictor2))
+    }
+
+    if (feat != "Time") { #Time cannot compile fully into knit (perhaps still too large? Sample)
+      plot(ForestICEPlot, plot_pdp = TRUE, centered = TRUE, x_quantile = F)
+    } else {
+      plot(ForestICEPlot, plot_pdp = TRUE, centered = TRUE, frac_to_plot = 0.5, x_quantile = F) #(0.5 of 25% SAMPLED)
+    }
+  }
+  
+  # SampledDataset <- cbind(xgb[, !"Tracer"], Y = xgb$Tracer_Conc) # For time split only
+  # for(feat in features) { #Time requires 37GB of ram for a vector.....
+  #   
+  #   #Dont do tests for time
+  #   if (feat == "Time") next
+  #   
+  #   SampledDataset[, Tracer_Conc := NULL]
+  #   SampledDataset[, PV := NULL]
+  #   SampledDataset[, Ogata := NULL]
+  #   
+  #   if (masterModel) {
+  #     ForestICEPlot <- invisible(ICEbox::ice(object =
+  #                                              results[["Master"]]$model, X = SampledDataset[, -("Y")], y =
+  #                                              SampledDataset$Y, predictor = feat, predictfcn = predictor2))
+  #   } else {
+  #     ForestICEPlot <- invisible(ICEbox::ice(object =
+  #                                              results[[tracer]]$model, X = dataset, y = datasetY, predictor = feat,
+  #                                            predictfcn = predictor2))
+  #   }
+  #   
+  #   print(feat)
+  #   #Backfitter
+  #   backfitted <- invisible(backfitter(X=as.matrix(X), y=as.vector(y), predictor = feat, eps =
+  #                                        .00025, fitMethod = fitter, predictfcn = predictor, iter.max = 50))
+  #   
+  #   colorFcn <- function(ice_obj) {
+  #     #ifelse(ice_obj$Xice$alcohol > 10, "RED", "GREEN")
+  #     return("WHITE")
+  #   }
+  #   
+  #   #Additivity stuff
+  #   additivity = additivityLineup(backfitted, fitMethod = fitter2, figs = 20, realICE= ForestICEPlot, centered = TRUE, x_quantile = TRUE, frac_to_plot = .1, plot_orig_pts=FALSE,
+  #                                 colorvecfcn = colorFcn, usecolorvecfcn_inreal=TRUE
+  #   )
+  #   
+  #   #additivity #(Printing is in additivityLineup function)
+  #   rm("ForestICEPlot")
+  #   invisible(gc())
+  # }
+  
+}
+
+```
+
+```{r}
+# #Set save directory
+# setwd(saveDirectory)
+# 
+# #Save the environment upon completion (takes a bit)
+# savePath <- paste(getwd(), "/result-KNITTED.Rdata", sep = "")
+# if(file.exists(savePath))
+#   file.remove(savePath)
+# save.image(savePath)
+
+#Scream for attention. Ideal when using MLR for forest after long wait times.
+print("Completed and Saved Successfully.")
+scream = FALSE
+#beep(10)
+while(scream) {
+  Sys.sleep(1)
+  #beep(10)
+}
+
+```
+

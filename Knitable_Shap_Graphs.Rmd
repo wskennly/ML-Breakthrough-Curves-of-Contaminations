@@ -1,0 +1,189 @@
+---
+title: "LOOCV R Model Generation, XGBOOST and OPTIMX"
+author: "Hubert B. Majewski, Kennly Weerasinghe"
+date: "8/1/2021"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+#Load libraries
+pacman::p_load(tidyverse, data.table, dplyr, testthat, numbers, ggplot2, scales, grid, gridExtra, cowplot, ggpubr, xgboost, ICEbox, ICE, vip, pdp, caret, SHAPforxgboost, fastshap, shapvis, h2o) # iml package?
+
+#Set memory limitations
+memory.limit(size = 32 * 1024 + 64 * 1024) # Where 64 is paging file size in GB
+
+#Set the current working directory (to pull data etc.)
+#setwd("./")
+
+#Set load directory
+loadDirectory <- getwd()
+
+#Load the data
+loadPath <- paste(loadDirectory, "/result.Rdata", sep = "")
+load(loadPath)
+
+#Setup parallel processing (for graphs)
+coreCluster <- parallel::makeCluster(cores, outfile="")
+doParallel::registerDoParallel(coreCluster, cores = cores)
+
+#Disable warnings for knit
+defaultWarnings <- getOption("warn")
+options(warn = -1)
+```
+
+```{r}
+#For each tracer, print the prediction that was out of sample
+#NOTE: All variables represented as "Time" are PV within the model output
+uniquetracers <- unique(xgb$Tracer)
+
+# #Shap/ICEPlot plots for Forest model (xgboost) only
+if (modelMethod == "forest" || modelMethod == "Forest") {
+  
+  #Shap values for each model
+  for (tracer in uniquetracers)
+  {
+    if (masterModel) {
+      features <- results[["Master"]]$model$feature_names
+      model <- results[["Master"]]$model
+      x_test <- xgb # x_test (tracer == tracer) is much faster (or sample?)
+    } else {
+      features <- results[[tracer]]$model$feature_names
+      model <- results[[tracer]]$model
+      x_test <- xgb[Tracer == tracer, ] # x_test (tracer == tracer) is much faster
+    }
+    
+    x_test <- x_test[, !c("PV", "Ogata", "Tracer_Conc")]
+    
+    prep <- shap.prep(model, X_train = data.matrix(x_test[, !"Tracer"])) #Use OOS (X_Test)
+    
+    graphs <- list()
+    
+    graphs[["Summary"]] <- (shap.plot.summary(prep) + ggtitle(paste("QSPR Model", "Summary")))
+    
+    #Forceplots for each tracer only
+    Shap_Values <- shap.values(xgb_model = model, X_train = data.matrix(x_test[, !"Tracer"]))
+    for(tracer2 in uniquetracers) {
+
+      prep2 <- shap.prep.stack.data(shap_contrib = shap.values(xgb_model = model, X_train = data.matrix(x_test[Tracer == tracer2, !"Tracer"]))$shap_score, top_n = 5, n_groups = 6) # Only for forceplot
+
+      if (tracer2 == "Benzene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 2350, y_parent_limit = c(-5,5), y_zoomin_limit = c(-3,3)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "Toluene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 1400, y_parent_limit = c(-4,4), y_zoomin_limit = c(-3,3)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "Ethylbenzene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 1300, y_parent_limit = c(-4,4), y_zoomin_limit = c(-1,1)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "o-Xylene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 1800, y_parent_limit = c(-4,4), y_zoomin_limit = c(-1,1)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "m-Xylene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 2100, y_parent_limit = c(-4,4), y_zoomin_limit = c(-1,1)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "p-Xylene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 1250, y_parent_limit = c(-4,4), y_zoomin_limit = c(-3,3)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "1,2,3-Trimethylbenzene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 1400, y_parent_limit = c(-4,4), y_zoomin_limit = c(-1,1)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "1,2,4-Trimethylbenzene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 800, y_parent_limit = c(-4,4), y_zoomin_limit = c(-1,1)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "1,3,5-Trimethylbenzene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 1350, y_parent_limit = c(-4,4), y_zoomin_limit = c(-3,3)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "n-Propylbenzene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 1500, y_parent_limit = c(-4,4), y_zoomin_limit = c(-3,3)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "Isopropylbenzene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 2100, y_parent_limit = c(-4,4), y_zoomin_limit = c(-3,3)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "1-Ethyl-2-methylbenzene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 2100, y_parent_limit = c(-4,4), y_zoomin_limit = c(-3,3)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "Isopropyl-4-methylbenzene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 1500, y_parent_limit = c(-4,4), y_zoomin_limit = c(-3,3)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "n-Butylbenzene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 2150, y_parent_limit = c(-4,4), y_zoomin_limit = c(-3,3)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "tert-Butylbenzene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 1600, y_parent_limit = c(-4,4), y_zoomin_limit = c(-3,3)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "tert-Butylbenzene(2)") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 1450, y_parent_limit = c(-4,4), y_zoomin_limit = c(-3,3)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "1,2,4,5-Tetramethylbenzene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 1175, y_parent_limit = c(-4,4), y_zoomin_limit = c(-3,3)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "Pentamethylbenzene") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 2300, y_parent_limit = c(-4,4), y_zoomin_limit = c(-3,3)) + ggtitle(tracer2)
+
+      } else if (tracer2 == "Pentamethylbenzene(2)") {
+        graphs[[paste("Force_Plot", tracer2)]] <- shap.plot.force_plot(prep2, zoom_in_location = 2500, y_parent_limit = c(-4,4), y_zoomin_limit = c(-3,3)) + ggtitle(tracer2)
+      }
+
+      print(paste(tracer, "Shap Scores"))
+      for(feat in features) {
+        print(paste(feat, "Min:", min(as.matrix(Shap_Values$shap_score[, ..feat])), "Mean:", mean(as.matrix(Shap_Values$shap_score[, ..feat])), "Max:", max(as.matrix(Shap_Values$shap_score[, ..feat]))))
+      }
+    }
+
+    #Print waterfall graphs
+    lapply(graphs, function(g) {print(g)})
+
+    #Write shap values
+    write.csv(Shap_Values$shap_score, "Shap_Values.csv")
+
+    graphs = list()
+    for (v in shap.importance(prep, names_only = TRUE)) {
+      if (masterModel) {
+        p <- shap.plot.dependence(prep, v, color_feature = "auto",
+                                  alpha = 0.5, jitter_width = 0.1) +
+          ggtitle(paste("QSPR Model Dependence", v))
+      } else {
+        p <- shap.plot.dependence(prep, v, color_feature = "auto",
+                                  alpha = 0.5, jitter_width = 0.1) +
+          ggtitle(paste(tracer2, "Dependence", v))
+      }
+
+      graphs[[v]] <- p
+
+    }
+    
+    lapply(graphs, function(g) {print(g)})
+    
+    
+    if (masterModel) return()
+  }
+  
+}
+
+
+
+```
+
+```{r}
+# #Set save directory
+# setwd(saveDirectory)
+# 
+# #Save the environment upon completion (takes a bit)
+# savePath <- paste(getwd(), "/result-KNITTED.Rdata", sep = "")
+# if(file.exists(savePath))
+#   file.remove(savePath)
+# save.image(savePath)
+
+#Scream for attention. Ideal when using MLR for forest after long wait times.
+print("Completed and Saved Successfully.")
+scream = FALSE
+#beep(10)
+while(scream) {
+  Sys.sleep(1)
+  #beep(10)
+}
+
+```
+
